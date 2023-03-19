@@ -1,0 +1,215 @@
+---
+- name: Install Rocket.Chat
+  hosts: all
+  become: yes
+
+  tasks:
+  - name: Add user 'chatserver'
+    user:
+      name: chatserver
+      shell: /bin/bash
+
+  - name: Switch to user 'chatserver'
+    become_user: chatserver
+
+  - name: Update and upgrade the system
+    apt:
+      update_cache: yes
+      upgrade: dist
+
+  - name: Install required packages/dependencies
+    apt:
+      name:
+        - gnupg2
+        - gnupg
+        - git
+        - unzip
+        - build-essential
+        - curl
+        - software-properties-common
+        - graphicsmagick
+        - gcc
+        - g++
+        - make
+        - net-tools
+      state: present
+
+  - name: Get server IP address
+    shell: ifconfig | grep 'inet ' | awk '{print $2}'
+    register: server_ip
+
+  - name: Import the public key used by the package management system
+    apt_key:
+      url: https://www.mongodb.org/static/pgp/server-5.0.asc
+      state: present
+
+  - name: Create a list file for mongodb
+    lineinfile:
+      path: /etc/apt/sources.list.d/mongodb-org-5.0.list
+      line: "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu focal/mongodb-org/5.0 multiverse"
+      state: present
+
+  - name: Reload local packages
+    apt:
+      update_cache: yes
+
+  - name: Install mongodb server
+    apt:
+      name: mongodb-org
+      state: present
+
+  - name: Hold mongodb-org packages
+    shell:
+      cmd: |
+        echo "mongodb-org hold" | sudo dpkg --set-selections
+        echo "mongodb-org-database hold" | sudo dpkg --set-selections
+        echo "mongodb-org-server hold" | sudo dpkg --set-selections
+        echo "mongodb-org-shell hold" | sudo dpkg --set-selections
+        echo "mongodb-org-mongos hold" | sudo dpkg --set-selections
+
+  - name: Start and enable mongod service
+    systemd:
+      name: mongod
+      state: started
+      enabled: yes
+
+  - name: Install Node.js v14
+    become: true
+    apt:
+      name: curl
+      state: present
+
+  - name: Add Node.js repository
+    become: true
+    apt_key:
+      url: https://deb.nodesource.com/gpgkey/nodesource.gpg.key
+    apt_repository:
+      repo: deb https://deb.nodesource.com/node_14.x {{ ansible_distribution_release }} main
+      state: present
+
+  - name: Install Node.js and npm
+    become: true
+    apt:
+      name:
+        - nodejs
+        - npm
+      state: present
+
+  - name: Install n module
+    become: true
+    npm:
+      name: n
+      global: yes
+
+  - name: Set Node.js version to v14.18
+    become: true
+    npm:
+      name: "n@{{ n_version }}"
+      global: yes
+    vars:
+      n_version: "14.18"
+
+  - name: Refresh hash
+    become: true
+    shell: hash -r
+
+  - name: Install Rocket.Chat
+    shell:
+      cmd: |
+        curl -L https://releases.rocket.chat/latest/download -o /tmp/rocket.chat.tgz
+        tar -xzf /tmp/rocket.chat.tgz -C /tmp
+        cd /tmp/bundle/programs/server
+        npm install
+        sudo mv /tmp/bundle /opt/Rocket.Chat
+
+  - name: Create 'rocketchat' user and set ownership
+    shell:
+      cmd: |
+        sudo useradd -M rocketchat
+        sudo usermod -L rocketchat
+        sudo chown -R rocketchat:rocketchat /opt/Rocket.Chat/
+
+  - name: Get server IP address
+    shell:
+      cmd: ifconfig | grep 'inet ' | awk '{print $2}'
+    register: server_ip
+
+  - name: Create Rocket.Chat service file
+    become: true
+    copy:
+      dest: /lib/systemd/system/rocketchat.service
+      content: |
+        [Unit]
+        Description=The Rocket.Chat server
+        After=network.target remote-fs.target nss-lookup.target nginx.service mongod.service
+  
+        [Service]
+        ExecStart=/usr/local/bin/node /opt/Rocket.Chat/main.js
+        StandardOutput=syslog
+        StandardError=syslog
+        SyslogIdentifier=rocketchat
+        User=rocketchat
+        Environment=ROOT_URL=http://{{ server_ip.stdout }}:3000
+        Environment=PORT=3000
+        Environment=MONGO_URL=mongodb://localhost:27017/rocketchat?replicaSet=rs01
+        Environment=MONGO_OPLOG_URL=mongodb://localhost:27017/local?replicaSet=rs01
+  
+        [Install]
+        WantedBy=multi-user.target
+
+  - name: Start and enable Rocket.Chat service
+    become: true
+    systemd:
+      name: rocketchat
+      state: started
+      enabled: true
+
+  - name: Edit mongo.conf file
+    become: true
+    blockinfile:
+      path: /etc/mongod.conf
+      block: |
+        storage:
+          dbPath: /var/lib/mongodb
+          journal:
+            enabled: true
+          engine: wiredTiger
+        #  wiredTiger:
+        # where to write logging data.
+        systemLog:
+          destination: file
+          logAppend: true
+          path: /var/log/mongodb/mongod.log
+        # network interfaces
+        net:
+          port: 27017
+          bindIp: 127.0.0.1
+
+        # how the process runs
+        processManagement:
+          timeZoneInfo: /usr/share/zoneinfo
+        replication:
+         replSetName: rs01
+
+  - name: Reload systemd daemon
+    become: true
+    systemd:
+      daemon_reload: yes
+
+  - name: Restart MongoDB
+    become: true
+    service:
+      name: mongod
+      state: restarted
+
+  - name: Enable MongoDB
+    become: true
+    service:
+      name: mongod
+      enabled: yes
+
+  - name: Restart Rocket.Chat
+    become: true
+    service:
+      name: rocketchat
+      state: restarted
